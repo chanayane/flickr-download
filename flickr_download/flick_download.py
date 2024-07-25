@@ -14,13 +14,17 @@ from typing import Any, Dict, Optional
 import flickr_api as Flickr
 import yaml
 from flickr_api.flickrerrors import FlickrAPIError, FlickrError
-from flickr_api.objects import Person, Photo, Photoset, Walker
+from flickr_api.objects import Person, Photo, Photoset, Gallery, Walker
 
 from flickr_download.filename_handlers import (
     FilenameHandler,
     get_filename_handler,
     get_filename_handler_help,
     get_filename_handler_names,
+    FilenameHandlerGallery,
+    get_filename_handler_gallery,
+    get_filename_handler_help_gallery,
+    get_filename_handler_names_gallery,
 )
 from flickr_download.logging_utils import APIKeysRedacter
 from flickr_download.utils import (
@@ -131,6 +135,28 @@ def download_set(
     )
 
 
+def download_gallery(
+    gallery_id: str,
+    get_filename: FilenameHandlerGallery,
+    size_label: Optional[str] = None,
+    skip_download: bool = False,
+    save_json: bool = False,
+    metadata_store: Optional[bool] = None,
+) -> None:
+    """Download the gallery with 'gallery_id' to the current directory.
+
+    :param gallery_id: id of the photo gallery
+    :param get_filename: function that creates a filename for the photo
+    :param size_label: size to download (or None for largest available)
+    :param skip_download: do not actually download the photo
+    :param save_json: save photo info as .json file
+    """
+    pgal = Flickr.Gallery(id=gallery_id)
+    download_list_gallery(
+        pgal, pgal.title, get_filename, size_label, skip_download, save_json, metadata_store
+    )
+
+
 def download_list(
     pset: Photoset,
     photos_title: str,
@@ -191,6 +217,66 @@ def download_list(
         conn.close()
 
 
+def download_list_gallery(
+    pgal: Gallery,
+    photos_title: str,
+    get_filename: FilenameHandlerGallery,
+    size_label: Optional[str],
+    skip_download: bool = False,
+    save_json: bool = False,
+    metadata_store: Optional[bool] = None,
+) -> None:
+    """Download all the photos in the given photo list.
+
+    :param pgal: photo list to download
+    :param photos_title: name of the photo list
+    :param get_filename: function that creates a filename for the photo
+    :param size_label: size to download (or None for largest available)
+    :param skip_download: do not actually download the photo
+    :param save_json: save photo info as .json file
+    """
+
+    photos = Walker(pgal.getPhotos)
+
+    suffix = f" ({size_label})" if size_label else ""
+
+    logging.info("Downloading %s", photos_title)
+    dirname = get_dirname(photos_title)
+    if not os.path.exists(dirname):
+        try:
+            os.mkdir(dirname)
+        except OSError as err:
+            if err.errno == errno.ENAMETOOLONG:
+                logging.warning("WARNING: Truncating too long directory name: %s", dirname)
+                # Not the most fantastic handling here, but it is surprisingly hard to get the max
+                # length in an OS-agnostic way... Assuming that most OSes can handle at least 200
+                # chars...
+                dirname = str(dirname)[:200]
+                os.mkdir(dirname)
+            else:
+                raise
+
+    conn = None
+    if metadata_store:
+        conn = _get_metadata_db(str(dirname))
+
+    for photo in photos:
+        do_download_photo_gallery(
+            dirname,
+            pgal,
+            photo,
+            size_label,
+            suffix,
+            get_filename,
+            skip_download,
+            save_json,
+            metadata_db=conn,
+        )
+
+    if conn:
+        conn.close()
+
+
 def do_download_photo(
     dirname: str,
     pset: Optional[Photoset],
@@ -224,6 +310,106 @@ def do_download_photo(
             return
 
     fname = get_full_path(dirname, get_filename(pset, photo, suffix))
+    fname = photo._getOutputFilename(fname, size_label)
+    json_fname = fname + ".json"
+
+    if not photo["loaded"]:
+        # trying not trigger two calls to Photo.getInfo here, as it will if it was already loaded
+        try:
+            photo.load()
+        except FlickrError:
+            logging.info("Skipping %s, because cannot get info from Flickr", fname)
+            return
+
+    if save_json:
+        try:
+            if Path(json_fname).exists():
+                logging.info("Skipping %s, as it exists already", json_fname)
+            else:
+                with open(json_fname, "w", encoding="utf-8") as json_file:
+                    logging.info("Saving photo info: %s", json_fname)
+                    photo_data = photo.__dict__.copy()
+                    try:
+                        photo_data["exif"] = photo.getExif()
+                    except FlickrAPIError as ex:
+                        if ex.code == 2:
+                            logging.warning("Could not get EXIF data. Likely not photo owner?")
+                        else:
+                            raise
+                    json_file.write(
+                        json.dumps(photo_data, default=serialize_json, indent=2, sort_keys=True)
+                    )
+        except Exception:
+            logging.warning("Trouble saving photo info: %s", sys.exc_info())
+
+    if not size_label and photo._getLargestSizeLabel() == "Video Player":
+        # For old videos there doesn't seem to be an actual video url
+        # available. The largest video size ends up being a SWF video player,
+        # and it's the SWF that'll be downloaded...
+        logging.error("Video not available for: %s", get_photo_page(photo))
+        return
+
+    if os.path.exists(fname):
+        # TODO: Ideally we should check for file size / md5 here
+        # to handle failed downloads.
+        logging.info("Skipping %s, as it exists already", fname)
+    else:
+        logging.info("Saving: %s (%s)", fname, get_photo_page(photo))
+        if skip_download:
+            return
+
+        try:
+            photo.save(fname, size_label)
+        except IOError as ex:
+            logging.error("IO error saving photo: %s", ex)
+            return
+        except FlickrError as ex:
+            logging.error("Flickr error saving photo: %s", ex)
+            return
+
+        # Set file times to when the photo was taken
+        set_file_time(fname, photo["taken"])
+
+    if metadata_db:
+        metadata_db.execute(
+            "INSERT INTO downloads VALUES (?, ?, ?)", (photo.id, size_label or "", suffix)
+        )
+        metadata_db.commit()
+
+
+def do_download_photo_gallery(
+    dirname: str,
+    pgal: Optional[Gallery],
+    photo: Photo,
+    size_label: Optional[str],
+    suffix: Optional[str],
+    get_filename: FilenameHandlerGallery,
+    skip_download: bool = False,
+    save_json: bool = False,
+    metadata_db: Optional[sqlite3.Connection] = None,
+) -> None:
+    """Handle the downloading of a single photo.
+
+    :param dirname: directory to download to
+    :param pgal: photo list to download
+    :param photo: photo to download
+    :param size_label: size to download (or None for largest available)
+    :param suffix: optional suffix to add to file name
+    :param get_filename: function that creates a filename for the photo
+    :param skip_download: do not actually download the photo
+    :param save_json: save photo info as .json file
+    :param metadata_db: optional metadata database to record downloads
+        in
+    """
+    if metadata_db:
+        if metadata_db.execute(
+            "SELECT * FROM downloads WHERE photo_id = ? AND size_label = ? AND suffix = ?",
+            (photo.id, size_label or "", suffix),
+        ).fetchone():
+            logging.info("Skipping download of already downloaded photo with ID: %s", photo.id)
+            return
+
+    fname = get_full_path(dirname, get_filename(pgal, photo, suffix))
     fname = photo._getOutputFilename(fname, size_label)
     json_fname = fname + ".json"
 
@@ -382,6 +568,16 @@ def print_sets(username: str) -> None:
     for photoset in photosets:
         print(f"{photoset.id} - {photoset.title}")
 
+def print_galleries(username: str) -> None:
+    """Print all galleries for the given user.
+
+    :param username: the name of the user
+    """
+    user = find_user(username)
+    galleries = Walker(user.getGalleries)  # pylint: disable=E1101
+    for gallery in galleries:
+        print(f"{gallery['id']} - {gallery['gallery_id']} - {gallery['title']}")
+
 
 def _get_arg_parser() -> argparse.ArgumentParser:
     """Gets a parser for the command line arguments."""
@@ -402,6 +598,9 @@ def _get_arg_parser() -> argparse.ArgumentParser:
         "  list all sets for a user:\n"
         "  > {app} -k <api_key> -s <api_secret> -l beaufour\n"
         "\n"
+        "  list all galleries for a user:\n"
+        "  > {app} -k <api_key> -s <api_secret> -gl beaufour\n"
+        "\n"
         "  download a given set:\n"
         "  > {app} -k <api_key> -s <api_secret> -d 72157622764287329\n"
         "\n"
@@ -414,8 +613,12 @@ def _get_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("-s", "--api_secret", type=str, help="Flickr API secret")
     parser.add_argument("-t", "--user_auth", action="store_true", help="Enable user authentication")
     parser.add_argument("-l", "--list", type=str, metavar="USER", help="List photosets for a user")
+    parser.add_argument("-gl", "--list_galleries", type=str, metavar="USER", help="List galleries for a user")
     parser.add_argument(
         "-d", "--download", type=str, metavar="SET_ID", help="Download the given set"
+    )
+    parser.add_argument(
+        "-dg", "--download_gallery", type=str, metavar="GAL_ID", help="Download the given gallery"
     )
     parser.add_argument(
         "-p",
@@ -454,7 +657,15 @@ def _get_arg_parser() -> argparse.ArgumentParser:
         metavar="NAMING_MODE",
         help="Photo naming mode. Use --list_naming to get a list of possible NAMING_MODEs",
     )
+    parser.add_argument(
+        "-ng",
+        "--naming_gallery",
+        choices=get_filename_handler_names_gallery(),
+        metavar="NAMING_MODE_GALLERY",
+        help="Photo naming mode for galleries. Use --list_naming_gallery to get a list of possible NAMING_MODE_GALLERYs",
+    )
     parser.add_argument("-m", "--list_naming", action="store_true", help="List naming modes")
+    parser.add_argument("-mg", "--list_naming_gallery", action="store_true", help="List naming modes for galleries")
     parser.add_argument(
         "-o",
         "--skip_download",
@@ -507,6 +718,10 @@ def main() -> int:
         print(get_filename_handler_help())
         return 1
 
+    if args.list_naming_gallery:
+        print(get_filename_handler_help_gallery())
+        return 1
+
     if not args.api_key or not args.api_secret:
         print(
             'You need to pass in both "api_key" and "api_secret" arguments',
@@ -523,6 +738,12 @@ def main() -> int:
         if cache:
             save_cache(args.cache, cache)
         return 0
+    
+    if args.list_galleries:
+        print_galleries(args.list_galleries)
+        if cache:
+            save_cache(args.cache, cache)
+        return 0
 
     if args.skip_download:
         logging.info("Will skip actual downloading of files")
@@ -530,13 +751,22 @@ def main() -> int:
     if args.save_json:
         logging.info("Will save photo info in .json file with same basename as photo")
 
-    if args.download or args.download_user or args.download_user_photos or args.download_photo:
+    if args.download or args.download_gallery or args.download_user or args.download_user_photos or args.download_photo:
         try:
             get_filename = get_filename_handler(args.naming)
             if args.download:
                 download_set(
                     args.download,
                     get_filename,
+                    args.quality,
+                    args.skip_download,
+                    args.save_json,
+                    args.metadata_store,
+                )
+            elif args.download_gallery:
+                download_gallery(
+                    args.download_gallery,
+                    get_filename_handler_gallery(args.naming_gallery),
                     args.quality,
                     args.skip_download,
                     args.save_json,
@@ -582,7 +812,7 @@ def main() -> int:
             save_cache(args.cache, cache)
         return 0
 
-    print("ERROR: Nothing to do?\n", file=sys.stderr)
+    print("ERROR: Nothing to do? :-)\n", file=sys.stderr)
     parser.print_help()
     return 1
 
